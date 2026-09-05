@@ -1,4 +1,4 @@
-const CACHE = "stocktaker-v4";
+const CACHE = "stocktaker-v5";
 const PRECACHE = [
   "/",
   "/index.html",
@@ -37,7 +37,9 @@ self.addEventListener("fetch", (event) => {
     url.hostname.includes("jsdelivr.net") ||
     url.hostname.includes("googleapis.com") ||
     url.hostname.includes("gstatic.com") ||
-    url.hostname.includes("tfhub.dev");
+    url.hostname.includes("tfhub.dev") ||
+    url.hostname.includes("tessdata.projectnaptha.com") ||
+    url.hostname.includes("unpkg.com");
 
   if (!isAppShell && !isModelCdn) return;
 

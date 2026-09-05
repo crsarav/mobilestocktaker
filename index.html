@@ -126,8 +126,8 @@
           <p id="cameraHint" class="camera-hint">Keep items in frame</p>
           <div id="detectBusy" class="busy">
             <div class="spinner" aria-hidden="true"></div>
-            <strong>Counting</strong>
-            <p>On-device object detection</p>
+            <strong id="busyTitle">Counting</strong>
+            <p id="busyHint">On-device object detection</p>
           </div>
           <div class="camera-bar">
             <button id="galleryBtn" class="circle-btn light" type="button" aria-label="Choose from gallery">
@@ -156,7 +156,7 @@
           </div>
           <div id="lines" class="lines"></div>
           <div class="card add-card">
-            <input id="customLabel" type="text" placeholder="Item name" />
+            <input id="customLabel" type="text" placeholder="Item name" autocomplete="off" />
             <input id="customQty" type="number" min="1" value="1" aria-label="Quantity" />
             <button id="addItemBtn" class="text-btn" type="button">Add</button>
           </div>
