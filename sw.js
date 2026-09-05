@@ -1,4 +1,4 @@
-const CACHE = "stocktaker-v8";
+const CACHE = "stocktaker-v9";
 const PRECACHE = [
   "/",
   "/index.html",
@@ -32,6 +32,8 @@ self.addEventListener("fetch", (event) => {
   if (request.method !== "GET") return;
 
   const url = new URL(request.url);
+  if (url.pathname.startsWith("/api/")) return;
+
   const isAppShell = url.origin === self.location.origin;
   const isModelCdn =
     url.hostname.includes("jsdelivr.net") ||

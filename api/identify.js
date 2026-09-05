@@ -1,16 +1,32 @@
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "4mb",
+    },
+  },
+};
+
 function parseItems(raw) {
   const text = String(raw || "")
     .replace(/```json/gi, "")
     .replace(/```/g, "")
     .trim();
-  const parsed = JSON.parse(text);
+  const match = text.match(/\{[\s\S]*\}/);
+  const parsed = JSON.parse(match ? match[0] : text);
   const rows = Array.isArray(parsed.items) ? parsed.items : [];
-  return rows
-    .map((row) => ({
-      name: String(row.name || "").trim(),
-      count: Math.max(1, Math.round(Number(row.count) || 1)),
-    }))
-    .filter((row) => row.name);
+  const merged = new Map();
+  rows.forEach((row) => {
+    const name = String(row.name || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const count = Math.max(1, Math.round(Number(row.count) || 1));
+    if (!name || name.length < 3) return;
+    const key = name.toLowerCase();
+    const current = merged.get(key);
+    if (current) current.count += count;
+    else merged.set(key, { name, count });
+  });
+  return Array.from(merged.values());
 }
 
 async function identifyWithGemini(apiKey, model, base64) {
@@ -23,20 +39,28 @@ async function identifyWithGemini(apiKey, model, base64) {
         {
           parts: [
             {
-              text: `You are counting sellable inventory in a photo for warehouse stock-taking.
+              text: `This is a warehouse/stock-take photo. It may be messy: mixed products on the floor, stacked cases, partial boxes.
+
+Task: list EVERY distinct product you can read from packaging.
+
 Rules:
-- Read the product name from packaging (brand + product). Example: "M&M's Milk Chocolate".
-- Count distinct physical units (jars, boxes, bags, bottles, packs). Two identical jars = count 2.
-- Do not count artwork, logos, or people. Ignore the floor and background.
-- Never invent generic object classes like toilet, bottle, or person.
-Return JSON only: {"items":[{"name":"string","count":number}]}`,
+- Use brand + product as printed, e.g. "Cottonelle Flushable Wipes", "Famous Amos Chocolate Chip Cookies", "Munchies Snack Mix", "Sun Chips".
+- Count physical sellable units: boxes, bags, jars, cases. Stacked Cottonelle boxes count as 2 if two boxes are visible.
+- Include partly visible products if the brand is readable.
+- Do not invent items. Do not return generic classes like toilet or bottle.
+- Do not OCR fragments like "FLUSHABLE WIPES" without the brand if the brand is visible.
+- Ignore people, carpet, and price stickers.
+
+Return JSON only:
+{"items":[{"name":"Cottonelle Flushable Wipes","count":2},{"name":"Cheetos","count":1}]}`,
             },
             { inline_data: { mime_type: "image/jpeg", data: base64 } },
           ],
         },
       ],
       generationConfig: {
-        temperature: 0.1,
+        temperature: 0,
+        maxOutputTokens: 1024,
         responseMimeType: "application/json",
       },
     }),
@@ -55,17 +79,24 @@ Return JSON only: {"items":[{"name":"string","count":number}]}`,
 }
 
 export default async function handler(req, res) {
+  const configured = Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
+
   if (req.method === "OPTIONS") {
     res.status(204).end();
     return;
   }
+
+  if (req.method === "GET") {
+    res.status(200).json({ configured });
+    return;
+  }
+
   if (req.method !== "POST") {
     res.status(405).json({ error: "method_not_allowed" });
     return;
   }
 
-  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-  if (!apiKey) {
+  if (!configured) {
     res.status(503).json({ error: "missing_key" });
     return;
   }
@@ -83,7 +114,8 @@ export default async function handler(req, res) {
       return;
     }
 
-    const models = ["gemini-2.5-flash", "gemini-2.0-flash"];
+    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+    const models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
     let lastError = "";
     for (const model of models) {
       try {

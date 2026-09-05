@@ -91,6 +91,7 @@
     scannedName: "",
     ocrPending: false,
     ocrToken: 0,
+    visionApi: false,
   };
 
   function toast(message) {
@@ -142,7 +143,15 @@
   }
 
   async function warmup() {
-    setStatus("ready", "Ready");
+    try {
+      const res = await fetch("/api/identify");
+      const json = await res.json();
+      state.visionApi = Boolean(json.configured);
+    } catch (error) {
+      state.visionApi = false;
+    }
+    if (state.visionApi) setStatus("ready", "Vision ready");
+    else setStatus("error", "Add API key");
     loadZxing().catch((error) => console.error(error));
   }
 
@@ -457,7 +466,7 @@
 
   async function blobToJpegBase64(blob) {
     const bitmap = await createImageBitmap(blob);
-    const maxEdge = 1280;
+    const maxEdge = 1600;
     const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.round(bitmap.width * scale));
@@ -480,10 +489,11 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ image }),
     });
-    if (response.status === 503) return null;
-    if (!response.ok) throw new Error(`identify ${response.status}`);
+    if (response.status === 503) return { status: "missing_key" };
+    if (response.status === 404) return { status: "missing_route" };
+    if (!response.ok) return { status: "error" };
     const payload = await response.json();
-    return Array.isArray(payload.items) ? payload.items : [];
+    return { status: "ok", items: Array.isArray(payload.items) ? payload.items : [] };
   }
 
   function applyScannedName(name) {
@@ -522,7 +532,7 @@
         },
       });
       els.preview.srcObject = state.stream;
-      els.cameraHint.textContent = "Center the label or barcode";
+      els.cameraHint.textContent = "Include every product you want counted";
     } catch (error) {
       console.error(error);
       els.cameraHint.textContent = "Camera blocked — use Gallery";
@@ -699,7 +709,7 @@
     els.detectBusy.classList.add("show");
     els.shutterBtn.disabled = true;
     if (els.busyTitle) els.busyTitle.textContent = "Identifying";
-    if (els.busyHint) els.busyHint.textContent = "Reading product and count";
+    if (els.busyHint) els.busyHint.textContent = "Finding every product in the photo";
     const token = ++state.ocrToken;
     try {
       state.photo = await createImageBitmap(blob);
@@ -722,26 +732,39 @@
     }
 
     try {
-      const apiItems = await identifyWithApi(blob);
+      const result = await identifyWithApi(blob);
       if (token !== state.ocrToken) return;
-      if (apiItems && applyItems(apiItems, "scan")) return;
+      if (result.status === "ok" && applyItems(result.items, "scan")) return;
+      if (result.status === "missing_key") {
+        state.ocrPending = false;
+        els.customLabel.placeholder = "Item name";
+        renderLines();
+        toast("Add GEMINI_API_KEY in Vercel, then redeploy.");
+        return;
+      }
+      if (result.status === "missing_route") {
+        toast("Vision API is not deployed. Redeploy the latest commit.");
+      } else if (result.status === "ok") {
+        toast("No products found. Try a closer photo of one SKU.");
+      } else {
+        toast("Vision lookup failed. Try again or enter items manually.");
+      }
     } catch (error) {
       console.error(error);
+      toast("Vision lookup failed. Try again or enter items manually.");
     }
 
     try {
-      const name = await readLabel(state.photo);
+      const name = await lookupBarcodeName((await decodeBarcode(state.photo)) || "");
       if (token !== state.ocrToken) return;
       state.ocrPending = false;
       applyScannedName(name);
-      if (!name) toast("Could not read the product. Type the name and count.");
     } catch (error) {
       console.error(error);
       if (token !== state.ocrToken) return;
       state.ocrPending = false;
       els.customLabel.placeholder = "Item name";
       renderLines();
-      toast("Could not read the product. Type the name and count.");
     }
   }
 

@@ -7,8 +7,8 @@ Product name and count use Gemini vision (`/api/identify`). If that is not confi
 ## Deploy on Vercel
 
 1. Import this GitHub repo in [Vercel](https://vercel.com/new).
-2. Add environment variable `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey).
-3. Deploy. Camera and Web Share require HTTPS.
+2. Add environment variable `GEMINI_API_KEY` from [Google AI Studio](https://aistudio.google.com/apikey) for **Production**, then redeploy.
+3. On the home screen the chip should say **Vision ready**. If it says **Add API key**, the key is missing and busy floor photos will not identify correctly.
 
 ## Local
 
