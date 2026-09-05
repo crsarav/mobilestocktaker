@@ -7,7 +7,7 @@ import struct
 import zlib
 from pathlib import Path
 
-OUT = Path(__file__).resolve().parent.parent / "public"
+OUT = Path(__file__).resolve().parent.parent / "icons"
 
 
 def chunk(tag: bytes, data: bytes) -> bytes:

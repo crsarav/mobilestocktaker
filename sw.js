@@ -1,13 +1,13 @@
-const CACHE = "stocktaker-v3";
+const CACHE = "stocktaker-v4";
 const PRECACHE = [
   "/",
   "/index.html",
   "/styles.css",
   "/app.js",
   "/manifest.json",
-  "/public/master-icon.svg",
-  "/public/icon-192.png",
-  "/public/icon-512.png",
+  "/icons/master-icon.svg",
+  "/icons/icon-192.png",
+  "/icons/icon-512.png",
 ];
 
 self.addEventListener("install", (event) => {

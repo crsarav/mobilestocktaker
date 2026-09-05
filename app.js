@@ -439,7 +439,7 @@
     els.installBtn.hidden = true;
   });
 
-  if ("serviceWorker" in navigator) {
+  if ("serviceWorker" in navigator && window.isSecureContext) {
     window.addEventListener("load", () => {
       navigator.serviceWorker.register("/sw.js").catch((error) => console.error(error));
     });
