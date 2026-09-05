@@ -4,6 +4,7 @@
   const TFJS_URL = "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js";
   const COCO_URL = "https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js";
   const TESS_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+  const ZXING_URL = "https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js";
   const MIN_SCORE = 0.5;
   const BOX_COLORS = ["#0666EB", "#6D3CFF", "#0EA5E9", "#16A34A", "#F59E0B"];
   const IGNORE_CLASSES = new Set([
@@ -150,7 +151,7 @@
       await loadScript(COCO_URL);
       state.model = await window.cocoSsd.load();
       setStatus("ready", "On-device ready");
-      loadOcr().catch((error) => console.error(error));
+      loadZxing().catch((error) => console.error(error));
     } catch (error) {
       console.error(error);
       setStatus("error", "Manual count only");
@@ -165,6 +166,12 @@
     return state.ocrWorker;
   }
 
+  async function loadZxing() {
+    if (window.ZXing) return window.ZXing;
+    await loadScript(ZXING_URL);
+    return window.ZXing;
+  }
+
   function photoToOcrCanvas(photo) {
     const maxEdge = 1400;
     const scale = Math.min(1, maxEdge / Math.max(photo.width, photo.height));
@@ -175,15 +182,27 @@
     return canvas;
   }
 
-  function preprocessForOcr(photo, crop) {
-    const src = photoToOcrCanvas(photo);
+  function rotateCanvas(src, quarterTurns) {
+    const turns = ((quarterTurns % 4) + 4) % 4;
+    if (turns === 0) return src;
+    const canvas = document.createElement("canvas");
+    canvas.width = turns % 2 ? src.height : src.width;
+    canvas.height = turns % 2 ? src.width : src.height;
+    const ctx = canvas.getContext("2d");
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate((turns * Math.PI) / 2);
+    ctx.drawImage(src, -src.width / 2, -src.height / 2);
+    return canvas;
+  }
+
+  function preprocessCanvas(src, crop) {
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d");
     if (crop) {
-      const width = src.width * 0.7;
-      const height = src.height * 0.5;
+      const width = src.width * 0.72;
+      const height = src.height * 0.52;
       const x = (src.width - width) / 2;
-      const y = src.height * 0.16;
+      const y = src.height * 0.14;
       canvas.width = Math.max(1, Math.round(width));
       canvas.height = Math.max(1, Math.round(height));
       ctx.drawImage(src, x, y, width, height, 0, 0, canvas.width, canvas.height);
@@ -213,6 +232,100 @@
     return canvas;
   }
 
+  function barcodeRegions(src) {
+    const regions = [src];
+    const strips = [
+      [src.width * 0.62, 0, src.width * 0.38, src.height],
+      [0, src.height * 0.62, src.width, src.height * 0.38],
+    ];
+    strips.forEach(([x, y, width, height]) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(width));
+      canvas.height = Math.max(1, Math.round(height));
+      canvas.getContext("2d").drawImage(src, x, y, width, height, 0, 0, canvas.width, canvas.height);
+      regions.push(canvas);
+    });
+    return regions;
+  }
+
+  async function decodeNativeBarcode(canvas) {
+    if (!("BarcodeDetector" in window)) return "";
+    try {
+      const detector = new window.BarcodeDetector({
+        formats: ["upc_a", "upc_e", "ean_13", "ean_8", "code_128", "code_39", "qr_code"],
+      });
+      const codes = await detector.detect(canvas);
+      return String(codes[0]?.rawValue || "").replace(/\s/g, "");
+    } catch (error) {
+      return "";
+    }
+  }
+
+  async function decodeZxingCanvas(canvas) {
+    const ZXing = await loadZxing();
+    if (!ZXing) return "";
+    try {
+      if (ZXing.BrowserMultiFormatReader) {
+        const reader = new ZXing.BrowserMultiFormatReader();
+        const result = await reader.decodeFromCanvas(canvas);
+        return String(result?.getText?.() || result?.text || "").replace(/\s/g, "");
+      }
+      const source = new ZXing.HTMLCanvasElementLuminanceSource(canvas);
+      const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(source));
+      const reader = new ZXing.MultiFormatReader();
+      const result = reader.decode(bitmap);
+      return String(result?.getText?.() || result?.text || "").replace(/\s/g, "");
+    } catch (error) {
+      return "";
+    }
+  }
+
+  async function decodeBarcode(photo) {
+    const base = photoToOcrCanvas(photo);
+    for (let turn = 0; turn < 4; turn++) {
+      const rotated = rotateCanvas(base, turn);
+      for (const region of barcodeRegions(rotated)) {
+        const nativeCode = await decodeNativeBarcode(region);
+        if (nativeCode.length >= 8) return nativeCode;
+        const zxingCode = await decodeZxingCanvas(region);
+        if (zxingCode.length >= 8) return zxingCode;
+      }
+    }
+    return "";
+  }
+
+  function cleanProductTitle(title) {
+    return titleCase(
+      String(title || "")
+        .split(/[|,]/)[0]
+        .replace(/\s+/g, " ")
+        .trim()
+    ).slice(0, 52);
+  }
+
+  async function lookupBarcodeName(code) {
+    const digits = String(code).replace(/\D/g, "");
+    if (digits.length < 8) return "";
+    try {
+      const res = await fetch(`https://world.openfoodfacts.org/api/v2/product/${digits}.json`);
+      if (res.ok) {
+        const json = await res.json();
+        if (json.status === 1 && json.product) {
+          const product = json.product;
+          const name = product.product_name_en || product.product_name || "";
+          const brand = product.brands ? String(product.brands).split(",")[0].trim() : "";
+          if (name && brand && !name.toLowerCase().includes(brand.toLowerCase())) {
+            return cleanProductTitle(`${brand} ${name}`);
+          }
+          return cleanProductTitle(name || brand);
+        }
+      }
+    } catch (error) {
+      console.error(error);
+    }
+    return "";
+  }
+
   function cleanPhrase(value) {
     return String(value || "")
       .replace(/[^A-Za-z0-9 &'’+.-]/g, " ")
@@ -223,7 +336,7 @@
   function scoreProductName(raw) {
     const cleaned = cleanPhrase(raw);
     if (!cleaned) return { name: "", score: 0 };
-    if (/usps|priority mail|postage|united states postal|click n ship/i.test(cleaned)) {
+    if (/usps|priority mail|postage|united states postal|click n ship|net wt|pouches/i.test(cleaned)) {
       return { name: "", score: 0 };
     }
     const words = cleaned.split(" ").filter(Boolean);
@@ -233,7 +346,8 @@
     if (!long.length) return { name: "", score: 0 };
 
     let score = long.length * 14 + Math.min(cleaned.length, 28);
-    if (words.length >= 2 && words.length <= 4) score += 12;
+    if (words.length >= 2 && words.length <= 5) score += 12;
+    if (/chocolate|chip|cookie|cracker|cereal|snack|candy|famous|amos/i.test(cleaned)) score += 16;
     score -= tiny.length * 10;
     if (tiny.length && tiny.length >= words.length - 1) score -= 20;
     return { name: titleCase(cleaned).slice(0, 48).trim(), score };
@@ -294,9 +408,10 @@
     const second = ranked[1];
     if (
       second &&
-      top.name.split(" ").length === 1 &&
-      second.name.split(" ").length === 1 &&
-      top.name.toLowerCase() !== second.name.toLowerCase()
+      top.name.split(" ").length <= 2 &&
+      second.name.split(" ").length <= 2 &&
+      top.name.toLowerCase() !== second.name.toLowerCase() &&
+      !top.name.toLowerCase().includes(second.name.toLowerCase())
     ) {
       const combo = scoreProductName(`${top.name} ${second.name}`);
       combo.score += bonus;
@@ -311,20 +426,26 @@
     return data;
   }
 
-  async function readLabel(photo) {
+  async function readLabelOcr(photo) {
     const worker = await loadOcr();
-    const center = preprocessForOcr(photo, true);
-    const centerName = pickProductName(await recognizeWithMode(worker, center, 6), 8);
-    if (centerName.score >= 20) return centerName.name;
-
-    const centerSparse = pickProductName(await recognizeWithMode(worker, center, 7), 6);
-    const bestCenter = centerSparse.score > centerName.score ? centerSparse : centerName;
-    if (bestCenter.score >= 20) return bestCenter.name;
-
-    const full = preprocessForOcr(photo, false);
-    const fullName = pickProductName(await recognizeWithMode(worker, full, 4), 0);
-    const best = [bestCenter, fullName].sort((a, b) => b.score - a.score)[0];
+    const base = photoToOcrCanvas(photo);
+    let best = { name: "", score: 0 };
+    for (let turn = 0; turn < 4; turn++) {
+      const rotated = rotateCanvas(base, turn);
+      const ranked = pickProductName(await recognizeWithMode(worker, preprocessCanvas(rotated, true), 6), 0);
+      if (ranked.score > best.score) best = ranked;
+      if (best.score >= 24) break;
+    }
     return best.score >= 18 ? best.name : "";
+  }
+
+  async function readLabel(photo) {
+    const code = await decodeBarcode(photo);
+    if (code) {
+      const catalogName = await lookupBarcodeName(code);
+      if (catalogName) return catalogName;
+    }
+    return readLabelOcr(photo);
   }
 
   function applyScannedName(name) {
@@ -364,7 +485,7 @@
         },
       });
       els.preview.srcObject = state.stream;
-      els.cameraHint.textContent = "Keep items in frame";
+      els.cameraHint.textContent = "Center the label or barcode";
     } catch (error) {
       console.error(error);
       els.cameraHint.textContent = "Camera blocked — use Gallery";
@@ -431,7 +552,7 @@
       const empty = document.createElement("article");
       empty.className = "card empty";
       empty.innerHTML = state.ocrPending
-        ? "<h2>Reading label…</h2><p>Scanning package text on this device.</p>"
+        ? "<h2>Identifying…</h2><p>Reading the barcode, then the package label.</p>"
         : "<h2>No items yet</h2><p>Add a line or snap a photo to detect stock.</p>";
       els.lines.appendChild(empty);
       refreshSummary();
@@ -540,8 +661,8 @@
   async function processPhoto(blob) {
     els.detectBusy.classList.add("show");
     els.shutterBtn.disabled = true;
-    if (els.busyTitle) els.busyTitle.textContent = "Counting";
-    if (els.busyHint) els.busyHint.textContent = "On-device object detection";
+    if (els.busyTitle) els.busyTitle.textContent = "Identifying";
+    if (els.busyHint) els.busyHint.textContent = "Barcode first, then label";
     const token = ++state.ocrToken;
     try {
       state.photo = await createImageBitmap(blob);
@@ -554,7 +675,7 @@
       }
       state.lines = groupLines(state.detections);
       state.ocrPending = true;
-      els.customLabel.placeholder = "Reading label…";
+      els.customLabel.placeholder = "Reading barcode…";
       drawOverlay();
       renderLines();
       showView("review");

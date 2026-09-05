@@ -1,4 +1,4 @@
-const CACHE = "stocktaker-v6";
+const CACHE = "stocktaker-v7";
 const PRECACHE = [
   "/",
   "/index.html",
