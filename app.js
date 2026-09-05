@@ -1,11 +1,8 @@
 (() => {
   "use strict";
 
-  const TFJS_URL = "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js";
-  const COCO_URL = "https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js";
   const TESS_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
   const ZXING_URL = "https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js";
-  const MIN_SCORE = 0.5;
   const BOX_COLORS = ["#0666EB", "#6D3CFF", "#0EA5E9", "#16A34A", "#F59E0B"];
   const IGNORE_CLASSES = new Set([
     "person",
@@ -144,19 +141,9 @@
     });
   }
 
-  async function loadModel() {
-    setStatus("loading", "Loading vision");
-    try {
-      await loadScript(TFJS_URL);
-      await loadScript(COCO_URL);
-      state.model = await window.cocoSsd.load();
-      setStatus("ready", "On-device ready");
-      loadZxing().catch((error) => console.error(error));
-    } catch (error) {
-      console.error(error);
-      setStatus("error", "Manual count only");
-      toast("Vision model unavailable. You can still count manually.");
-    }
+  async function warmup() {
+    setStatus("ready", "Ready");
+    loadZxing().catch((error) => console.error(error));
   }
 
   async function loadOcr() {
@@ -448,24 +435,74 @@
     return readLabelOcr(photo);
   }
 
+  function applyItems(items, source) {
+    const lines = (items || [])
+      .map((item) => ({
+        id: nextId(),
+        label: String(item.name || "").trim(),
+        count: Math.max(1, Math.round(Number(item.count) || 1)),
+        source,
+      }))
+      .filter((item) => item.label);
+    if (!lines.length) return false;
+    state.lines = lines;
+    state.scannedName = lines[0].label;
+    els.customLabel.value = lines[0].label;
+    els.customLabel.placeholder = "Item name";
+    els.customQty.value = String(lines[0].count);
+    state.ocrPending = false;
+    renderLines();
+    return true;
+  }
+
+  async function blobToJpegBase64(blob) {
+    const bitmap = await createImageBitmap(blob);
+    const maxEdge = 1280;
+    const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const jpeg = await canvasToBlob(canvas);
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(jpeg);
+    });
+    return dataUrl.replace(/^data:image\/\w+;base64,/, "");
+  }
+
+  async function identifyWithApi(blob) {
+    const image = await blobToJpegBase64(blob);
+    const response = await fetch("/api/identify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image }),
+    });
+    if (response.status === 503) return null;
+    if (!response.ok) throw new Error(`identify ${response.status}`);
+    const payload = await response.json();
+    return Array.isArray(payload.items) ? payload.items : [];
+  }
+
   function applyScannedName(name) {
     els.customLabel.placeholder = "Item name";
     if (!name) {
       renderLines();
       return;
     }
-    state.scannedName = name;
     if (!els.customLabel.value.trim()) els.customLabel.value = name;
     if (!state.lines.length) {
-      state.lines.push({ id: nextId(), label: name, count: 1, source: "scan" });
-    } else {
-      state.lines.forEach((line) => {
-        if (line.source === "auto") {
-          line.label = name;
-          line.source = "scan";
-        }
-      });
+      applyItems([{ name, count: 1 }], "scan");
+      return;
     }
+    state.lines.forEach((line) => {
+      if (line.source === "auto") {
+        line.label = name;
+        line.source = "scan";
+      }
+    });
     renderLines();
   }
 
@@ -662,26 +699,22 @@
     els.detectBusy.classList.add("show");
     els.shutterBtn.disabled = true;
     if (els.busyTitle) els.busyTitle.textContent = "Identifying";
-    if (els.busyHint) els.busyHint.textContent = "Barcode first, then label";
+    if (els.busyHint) els.busyHint.textContent = "Reading product and count";
     const token = ++state.ocrToken;
     try {
       state.photo = await createImageBitmap(blob);
       state.detections = [];
+      state.lines = [];
       state.scannedName = "";
       els.customLabel.value = "";
-      if (state.model) {
-        const detections = await state.model.detect(state.photo);
-        state.detections = detections.filter((det) => det.score >= MIN_SCORE);
-      }
-      state.lines = groupLines(state.detections);
       state.ocrPending = true;
-      els.customLabel.placeholder = "Reading barcode…";
+      els.customLabel.placeholder = "Identifying…";
       drawOverlay();
       renderLines();
       showView("review");
     } catch (error) {
       console.error(error);
-      toast("Could not count this photo. Try another angle.");
+      toast("Could not open this photo. Try another angle.");
       return;
     } finally {
       els.detectBusy.classList.remove("show");
@@ -689,18 +722,26 @@
     }
 
     try {
+      const apiItems = await identifyWithApi(blob);
+      if (token !== state.ocrToken) return;
+      if (apiItems && applyItems(apiItems, "scan")) return;
+    } catch (error) {
+      console.error(error);
+    }
+
+    try {
       const name = await readLabel(state.photo);
       if (token !== state.ocrToken) return;
       state.ocrPending = false;
       applyScannedName(name);
-      if (!name) toast("Could not read a label. Type the item name.");
+      if (!name) toast("Could not read the product. Type the name and count.");
     } catch (error) {
       console.error(error);
       if (token !== state.ocrToken) return;
       state.ocrPending = false;
       els.customLabel.placeholder = "Item name";
       renderLines();
-      toast("Could not read a label. Type the item name.");
+      toast("Could not read the product. Type the name and count.");
     }
   }
 
@@ -828,5 +869,5 @@
 
   restoreLocation();
   renderLines();
-  loadModel();
+  warmup();
 })();
