@@ -161,17 +161,12 @@
   async function loadOcr() {
     if (state.ocrWorker) return state.ocrWorker;
     await loadScript(TESS_URL);
-    const worker = await window.Tesseract.createWorker("eng");
-    await worker.setParameters({
-      tessedit_pageseg_mode: "11",
-      tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 &'-+.",
-    });
-    state.ocrWorker = worker;
-    return worker;
+    state.ocrWorker = await window.Tesseract.createWorker("eng");
+    return state.ocrWorker;
   }
 
   function photoToOcrCanvas(photo) {
-    const maxEdge = 1280;
+    const maxEdge = 1400;
     const scale = Math.min(1, maxEdge / Math.max(photo.width, photo.height));
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.round(photo.width * scale));
@@ -180,20 +175,77 @@
     return canvas;
   }
 
-  function productNameFromText(text) {
-    const lines = String(text || "")
-      .split(/\n+/)
-      .map((line) => line.replace(/[^A-Za-z0-9 &'’+.-]/g, " ").replace(/\s+/g, " ").trim())
-      .filter((line) => line.length >= 3)
-      .filter((line) => /[A-Za-z]{3,}/.test(line))
-      .filter((line) => !/^\d+$/.test(line));
-    if (!lines.length) return "";
-    return titleCase(lines.slice(0, 3).join(" ")).slice(0, 48).trim();
+  function preprocessForOcr(photo, crop) {
+    const src = photoToOcrCanvas(photo);
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    if (crop) {
+      const width = src.width * 0.7;
+      const height = src.height * 0.5;
+      const x = (src.width - width) / 2;
+      const y = src.height * 0.16;
+      canvas.width = Math.max(1, Math.round(width));
+      canvas.height = Math.max(1, Math.round(height));
+      ctx.drawImage(src, x, y, width, height, 0, 0, canvas.width, canvas.height);
+    } else {
+      canvas.width = src.width;
+      canvas.height = src.height;
+      ctx.drawImage(src, 0, 0);
+    }
+
+    const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const pixels = image.data;
+    let sum = 0;
+    const count = pixels.length / 4;
+    for (let i = 0; i < pixels.length; i += 4) {
+      const gray = 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+      pixels[i] = pixels[i + 1] = pixels[i + 2] = gray;
+      sum += gray;
+    }
+    const mean = sum / count;
+    for (let i = 0; i < pixels.length; i += 4) {
+      let value = (pixels[i] - mean) * 1.7 + 140;
+      if (value < 55) value = 0;
+      else if (value > 210) value = 255;
+      pixels[i] = pixels[i + 1] = pixels[i + 2] = value;
+    }
+    ctx.putImageData(image, 0, 0);
+    return canvas;
   }
 
-  function productNameFromOcr(data) {
+  function cleanPhrase(value) {
+    return String(value || "")
+      .replace(/[^A-Za-z0-9 &'’+.-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function scoreProductName(raw) {
+    const cleaned = cleanPhrase(raw);
+    if (!cleaned) return { name: "", score: 0 };
+    if (/usps|priority mail|postage|united states postal|click n ship/i.test(cleaned)) {
+      return { name: "", score: 0 };
+    }
+    const words = cleaned.split(" ").filter(Boolean);
+    const letters = (word) => word.replace(/[^A-Za-z]/g, "");
+    const long = words.filter((word) => letters(word).length >= 4);
+    const tiny = words.filter((word) => letters(word).length <= 2);
+    if (!long.length) return { name: "", score: 0 };
+
+    let score = long.length * 14 + Math.min(cleaned.length, 28);
+    if (words.length >= 2 && words.length <= 4) score += 12;
+    score -= tiny.length * 10;
+    if (tiny.length && tiny.length >= words.length - 1) score -= 20;
+    return { name: titleCase(cleaned).slice(0, 48).trim(), score };
+  }
+
+  function phrasesFromOcr(data) {
+    const phrases = [];
+    (data.lines || []).forEach((line) => {
+      if ((line.confidence || 0) >= 50) phrases.push(line.text);
+    });
     const words = (data.words || [])
-      .filter((word) => (word.confidence || 0) >= 58)
+      .filter((word) => (word.confidence || 0) >= 62)
       .map((word) => {
         const bbox = word.bbox || {};
         return {
@@ -204,33 +256,75 @@
         };
       })
       .filter((word) => word.text.length >= 2 && /[A-Za-z]/.test(word.text))
-      .filter((word) => !OCR_STOP.has(word.text.toLowerCase()));
+      .filter((word) => !OCR_STOP.has(word.text.toLowerCase()))
+      .sort((a, b) => a.y - b.y || a.x - b.x);
 
-    if (!words.length) return productNameFromText(data.text);
+    const grouped = [];
+    words.forEach((word) => {
+      const last = grouped[grouped.length - 1];
+      if (last && Math.abs(word.y - last.y) < Math.max(14, last.h * 0.65)) {
+        last.words.push(word);
+        last.y = (last.y + word.y) / 2;
+      } else {
+        grouped.push({ y: word.y, h: word.h, words: [word] });
+      }
+    });
+    grouped.forEach((line) => {
+      phrases.push(
+        line.words
+          .sort((a, b) => a.x - b.x)
+          .map((word) => word.text)
+          .join(" ")
+      );
+    });
+    String(data.text || "")
+      .split(/\n+/)
+      .forEach((line) => phrases.push(line));
+    return phrases;
+  }
 
-    const maxH = Math.max(...words.map((word) => word.h), 1);
-    const prominent = words.filter((word) => word.h >= maxH * 0.4);
-    const use = prominent.length ? prominent : words;
-    use.sort((a, b) => a.y - b.y || a.x - b.x);
+  function pickProductName(data, bonus) {
+    const ranked = phrasesFromOcr(data)
+      .map((phrase) => scoreProductName(phrase))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+    if (!ranked.length) return { name: "", score: 0 };
 
-    const parts = [];
-    const seen = new Set();
-    for (const word of use) {
-      const key = word.text.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      parts.push(word.text);
-      if (parts.join(" ").length > 42) break;
+    const top = ranked[0];
+    const second = ranked[1];
+    if (
+      second &&
+      top.name.split(" ").length === 1 &&
+      second.name.split(" ").length === 1 &&
+      top.name.toLowerCase() !== second.name.toLowerCase()
+    ) {
+      const combo = scoreProductName(`${top.name} ${second.name}`);
+      combo.score += bonus;
+      if (combo.score >= top.score + bonus) return combo;
     }
+    return { name: top.name, score: top.score + bonus };
+  }
 
-    const name = titleCase(parts.join(" ").replace(/\s+/g, " ").trim());
-    return name || productNameFromText(data.text);
+  async function recognizeWithMode(worker, canvas, mode) {
+    await worker.setParameters({ tessedit_pageseg_mode: String(mode) });
+    const { data } = await worker.recognize(canvas);
+    return data;
   }
 
   async function readLabel(photo) {
     const worker = await loadOcr();
-    const { data } = await worker.recognize(photoToOcrCanvas(photo));
-    return productNameFromOcr(data);
+    const center = preprocessForOcr(photo, true);
+    const centerName = pickProductName(await recognizeWithMode(worker, center, 6), 8);
+    if (centerName.score >= 20) return centerName.name;
+
+    const centerSparse = pickProductName(await recognizeWithMode(worker, center, 7), 6);
+    const bestCenter = centerSparse.score > centerName.score ? centerSparse : centerName;
+    if (bestCenter.score >= 20) return bestCenter.name;
+
+    const full = preprocessForOcr(photo, false);
+    const fullName = pickProductName(await recognizeWithMode(worker, full, 4), 0);
+    const best = [bestCenter, fullName].sort((a, b) => b.score - a.score)[0];
+    return best.score >= 18 ? best.name : "";
   }
 
   function applyScannedName(name) {
